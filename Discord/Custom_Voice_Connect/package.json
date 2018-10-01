@@ -1,0 +1,8 @@
+{
+“name”: “custom-voice-bot”,
+“version”: “1.0.0”,
+“description”: “customize your bip's connection”,
+“main”: “bot.js”,
+“author”: “Your Name”,
+“dependencies”: {}
+}
