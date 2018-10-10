@@ -1,118 +1,381 @@
-# inspired from https://github.com/Cog-Creators/Red-DiscordBot/blob/develop/cogs/audio.py
+import asyncio
+from copy import deepcopy
+import os
+import os.path
+
+import aiohttp
 import discord
+from discord.ext import commands
 
-TOKEN = 'LETOKENLAAAAAAAAAAA'
+from .utils.dataIO import dataIO
+from .utils import checks, chat_formatting as cf
 
-client = discord.Client()
-voice = discord.Voice()
-	
-@client.event
-async def on_group_join(channel,user):
-	user.
-	
 
-class Playlist:
-    def __init__(self, server=None, sid=None, name=None, author=None, url=None,
-                 playlist=None, path=None, main_class=None, **kwargs):
-        self.server = server
-        self._sid = sid
-        self.name = name
-        # this is an id......
-        self.author = author
-        self.url = url
-        self.main_class = main_class  # reference to Audio
-        self.path = path
-	
-@property
-    def filename(self):
-        f = "data/audio/playlists"
-        f = os.path.join(f, self.sid, self.name + ".txt")
-        return f
-		
-	def _make_local_song(self, filename):
-        # filename should be playlist_folder/file_name
-        folder, song = os.path.split(filename)
-        return Song(name=song, id=filename, title=song, url=filename,
-                    webpage_url=filename)
-		
-	def append_song(self, author, url):
-        if not self.can_edit(author):
-            raise UnauthorizedSave
-        elif not self.main_class._valid_playable_url(url):
-            raise InvalidURL
-        else:
-            self.playlist.append(url)
-            self.save()
+default_settings = {
+    "join_on": False,
+    "leave_on": False
+}
 
-    def save(self):
-        dataIO.save_json(self.path, self.to_json())
-		
-		
- @audioset.command(name="emptydisconnect", pass_context=True)
-    @checks.mod_or_permissions(manage_messages=True)
-    async def audioset_emptydisconnect(self, ctx):
-        """Toggles auto disconnection when everyone leaves the channel"""
-        server = ctx.message.server
-        settings = self.get_server_settings(server.id)
-        noppl_disconnect = settings.get("NOPPL_DISCONNECT", True)
-        self.set_server_setting(server, "NOPPL_DISCONNECT",
-                                not noppl_disconnect)
-        if not noppl_disconnect:
-            await self.bot.say("If there is no one left in the voice channel"
-                               " the bot will automatically disconnect after"
-                               " five minutes.")
-        else:
-            await self.bot.say("The bot will no longer auto disconnect"
-                               " if the voice channel is empty.")
-        self.save_settings()
-		
-@playlist.command(pass_context=True, no_pm=True, name="start")
-    async def playlist_start(self, ctx, name):
-        """Plays a playlist."""
-        server = ctx.message.server
-        author = ctx.message.author
-        voice_channel = ctx.message.author.voice_channel
-        channel = ctx.message.channel
 
-        caller = inspect.currentframe().f_back.f_code.co_name
+class CustomJoinLeave:
 
-        if voice_channel is None:
-            await self.bot.say("You must be in a voice channel to start a"
-                               " playlist.")
+    """Play a sound byte when you join or leave a channel."""
+
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.audio_players = {}
+        self.sound_base = "data/customjoinleave"
+        self.settings_path = "data/customjoinleave/settings.json"
+        self.settings = dataIO.load_json(self.settings_path)
+
+    def voice_channel_full(self, voice_channel: discord.Channel) -> bool:
+        return (voice_channel.user_limit != 0 and
+                len(voice_channel.voice_members) >= voice_channel.user_limit)
+
+    def voice_connected(self, server: discord.Server) -> bool:
+        return self.bot.is_voice_connected(server)
+
+    def voice_client(self, server: discord.Server) -> discord.VoiceClient:
+        return self.bot.voice_client_in(server)
+
+    async def _leave_voice_channel(self, server: discord.Server):
+        if not self.voice_connected(server):
+            return
+        voice_client = self.voice_client(server)
+
+        if server.id in self.audio_players:
+            self.audio_players[server.id].stop()
+        await voice_client.disconnect()
+
+    async def wait_for_disconnect(self, server: discord.Server):
+        while not self.audio_players[server.id].is_done():
+            await asyncio.sleep(0.01)
+        await self._leave_voice_channel(server)
+
+    async def sound_init(self, server: discord.Server, path: str):
+        audio_cog = self.bot.get_cog("Audio")
+        use_avconv = (audio_cog.settings["AVCONV"]
+          if audio_cog is not None else False)
+
+        options = "-filter \"volume=volume=0.15\""
+        voice_client = self.voice_client(server)
+        self.audio_players[server.id] = voice_client.create_ffmpeg_player(
+            path, use_avconv=use_avconv, options=options)
+
+    async def sound_play(self, server: discord.Server,
+                         channel: discord.Channel, p: str):
+        if self.voice_channel_full(channel):
             return
 
-        if self._playlist_exists(server, name):
-            if not self.voice_connected(server):
-                try:
-                    self.has_connect_perm(author, server)
-                except AuthorNotConnected:
-                    await self.bot.say("You must join a voice channel before"
-                                       " I can play anything.")
-                    return
-                except UnauthorizedConnect:
-                    await self.bot.say("I don't have permissions to join your"
-                                       " voice channel.")
-                    return
-                except UnauthorizedSpeak:
-                    await self.bot.say("I don't have permissions to speak in"
-                                       " your voice channel.")
-                    return
-                except ChannelUserLimit:
-                    await self.bot.say("Your voice channel is full.")
-                    return
+        if not channel.is_private:
+            if self.voice_connected(server):
+                if server.id not in self.audio_players:
+                    await self.sound_init(server, p)
+                    self.audio_players[server.id].start()
+                    await self.wait_for_disconnect(server)
                 else:
-                    await self._join_voice_channel(voice_channel)
-            self._clear_queue(server)
-            playlist = self._load_playlist(server, name,
-                                           local=self._playlist_exists_local(
-                                               server, name))
-            if caller == "playlist_start_mix":
-                shuffle(playlist.playlist)
+                    if self.audio_players[server.id].is_playing():
+                        self.audio_players[server.id].stop()
+                    await self.sound_init(server, p)
+                    self.audio_players[server.id].start()
+                    await self.wait_for_disconnect(server)
+            else:
+                await self.bot.join_voice_channel(channel)
+                if server.id not in self.audio_players:
+                    await self.sound_init(server, p)
+                    self.audio_players[server.id].start()
+                    await self.wait_for_disconnect(server)
+                else:
+                    if self.audio_players[server.id].is_playing():
+                        self.audio_players[server.id].stop()
+                    await self.sound_init(server, p)
+                    self.audio_players[server.id].start()
+                    await self.wait_for_disconnect(server)
 
-            self._play_playlist(server, playlist, channel)
-            await self.bot.say("Playlist queued.")
+    @commands.group(pass_context=True, no_pm=True, name="joinleaveset")
+    async def _joinleaveset(self, ctx: commands.Context):
+        """Sets custom join/leave settings."""
+
+        server = ctx.message.server
+        if server.id not in self.settings:
+            self.settings[server.id] = deepcopy(default_settings)
+            dataIO.save_json(self.settings_path, self.settings)
+        if ctx.invoked_subcommand is None:
+            await self.bot.send_cmd_help(ctx)
+
+    @_joinleaveset.command(pass_context=True, no_pm=True, name="togglejoin")
+    @checks.admin_or_permissions(manage_server=True)
+    async def _togglejoin(self, ctx: commands.Context):
+        """Toggles custom join sounds on/off."""
+
+        await self.bot.type()
+
+        server = ctx.message.server
+        self.settings[server.id][
+            "join_on"] = not self.settings[server.id]["join_on"]
+        if self.settings[server.id]["join_on"]:
+            await self.bot.reply(
+                cf.info("Custom join sounds are now enabled."))
         else:
-            await self.bot.say("That playlist does not exist.")
+            await self.bot.reply(
+                cf.info("Custom join sounds are now disabled."))
+        dataIO.save_json(self.settings_path, self.settings)
+
+    @_joinleaveset.command(pass_context=True, no_pm=True, name="toggleleave")
+    @checks.admin_or_permissions(manage_server=True)
+    async def _toggleleave(self, ctx: commands.Context):
+        """Toggles custom join sounds on/off."""
+
+        await self.bot.type()
+
+        server = ctx.message.server
+        self.settings[server.id]["leave_on"] = not self.settings[
+            server.id]["leave_on"]
+        if self.settings[server.id]["leave_on"]:
+            await self.bot.reply(
+                cf.info("Custom leave sounds are now enabled."))
+        else:
+            await self.bot.reply(
+                cf.info("Custom leave sounds are now disabled."))
+        dataIO.save_json(self.settings_path, self.settings)
+
+    @commands.command(pass_context=True, no_pm=True, name="setjoinsound")
+    async def _setjoinsound(self, ctx: commands.Context,
+                            link: str=None):
+        """Sets the join sound for the calling user."""
+
+        await self._set_sound(ctx, link, "join", ctx.message.author.id)
+
+    @commands.command(pass_context=True, no_pm=True, name="setleavesound")
+    async def _setleavesound(self, ctx: commands.Context,
+                             link: str=None):
+        """Sets the leave sound for the calling user."""
+
+        await self._set_sound(ctx, link, "leave", ctx.message.author.id)
+
+    @commands.command(pass_context=True, no_pm=True, name="setjoinsoundfor")
+    @checks.admin_or_permissions(Administrator=True)
+    async def _setjoinsoundfor(self, ctx: commands.Context,
+                               user: discord.User, link: str=None):
+        """Sets the join sound for the given user."""
+
+        await self._set_sound(ctx, link, "join", user.id)
+
+    @commands.command(pass_context=True, no_pm=True, name="setleavesoundfor")
+    @checks.admin_or_permissions(Administrator=True)
+    async def _setleavesoundfor(self, ctx: commands.Context,
+                                user: discord.User, link: str=None):
+        """Sets the leave sound for the given user."""
+
+        await self._set_sound(ctx, link, "leave", user.id)
+
+    async def _set_sound(self, ctx: commands.Context, link: str,
+                         action: str, userid: str):
+        await self.bot.type()
+
+        server = ctx.message.server
+        if server.id not in self.settings:
+            self.settings[server.id] = deepcopy(default_settings)
+            dataIO.save_json(self.settings_path, self.settings)
+
+        attach = ctx.message.attachments
+        if len(attach) > 1 or (attach and link):
+            await self.bot.reply(cf.error("Please only provide one file."))
+            return
+
+        url = ""
+        if attach:
+            url = attach[0]["url"]
+        elif link:
+            url = link
+        else:
+            await self.bot.reply(cf.error(
+                "You must provide either a Discord "
+                "attachment or a direct link to a sound."))
+            return
+
+        path = "{}/{}".format(self.sound_base, server.id)
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+        path = "{}/{}/{}".format(self.sound_base, server.id, userid)
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+        path += "/" + action
+        if os.path.exists(path):
+            await self.bot.reply(cf.question(
+                "There is already a custom {} sound. "
+                "Do you want to replace it? (yes/no)".format(action)))
+            answer = await self.bot.wait_for_message(timeout=15,
+                                                     author=ctx.message.author)
+
+            if answer is None or answer.content.lower().strip() != "yes":
+                await self.bot.reply(
+                    "{} sound not replaced.".format(action.capitalize()))
+                return
+
+            os.remove(path)
+
+        async with aiohttp.get(url) as nwsnd:
+            f = open(path, "wb")
+            f.write(await nwsnd.read())
+            f.close
+            await self.bot.reply("{} sound added.".format(action.capitalize()))
+
+    @commands.command(pass_context=True, no_pm=True, name="deljoinsound")
+    async def _deljoinsound(self, ctx: commands.Context):
+        """Deletes the join sound for the calling user."""
+
+        await self._del_sound(ctx, "join", ctx.message.author.id)
+
+    @commands.command(pass_context=True, no_pm=True, name="delleavesound")
+    async def _delleavesound(self, ctx: commands.Context):
+        """Deletes the leave sound for the calling user."""
+
+        await self._del_sound(ctx, "leave", ctx.message.author.id)
+
+    @commands.command(pass_context=True, no_pm=True, name="deljoinsoundfor")
+    @checks.admin_or_permissions(Administrator=True)
+    async def _deljoinsoundfor(self, ctx: commands.Context,
+                               user: discord.User):
+        """Deletes the join sound for the given user."""
+
+        await self._del_sound(ctx, "join", user.id)
+
+    @commands.command(pass_context=True, no_pm=True, name="delleavesoundfor")
+    @checks.admin_or_permissions(Administrator=True)
+    async def _delleavesoundfor(self, ctx: commands.Context,
+                                user: discord.User):
+        """Deletes the leave sound for the given user."""
+
+        await self._del_sound(ctx, "leave", user.id)
+
+    async def _del_sound(self, ctx, action, userid):
+        await self.bot.type()
+
+        server = ctx.message.server
+        if server.id not in self.settings:
+            self.settings[server.id] = deepcopy(default_settings)
+            dataIO.save_json(self.settings_path, self.settings)
+
+        path = "{}/{}".format(self.sound_base, server.id)
+        if not os.path.exists(path):
+            await self.bot.reply(cf.warning(
+                "There is not a custom {} sound.".format(action)))
+            return
+
+        path = "{}/{}/{}".format(self.sound_base, server.id, userid)
+        if not os.path.exists(path):
+            await self.bot.reply(cf.warning(
+                "There is not a custom {} sound.".format(action)))
+            return
+
+        path += "/" + action
+        if not os.path.exists(path):
+            await self.bot.reply(cf.warning(
+                "There is not a custom {} sound.".format(action)))
+            return
+
+        os.remove(path)
+        await self.bot.reply(cf.info(
+            "{} sound deleted.".format(action.capitalize())))
+
+    async def voice_state_update(self, before: discord.Member,
+                                 after: discord.Member):
+        bserver = before.server
+        aserver = after.server
+
+        bvchan = before.voice.voice_channel
+        avchan = after.voice.voice_channel
+
+        sfx_cog = self.bot.get_cog("Sfx")
+
+        if bserver.id not in self.settings:
+            self.settings[bserver.id] = deepcopy(default_settings)
+            dataIO.save_json(self.settings_path, self.settings)
+
+        if aserver.id not in self.settings:
+            self.settings[aserver.id] = deepcopy(default_settings)
+            dataIO.save_json(self.settings_path, self.settings)
+
+        if bvchan != avchan:
+            # went from no channel to a channel
+            if (bvchan is None and avchan is not None and
+                    self.settings[aserver.id]["join_on"] and
+                    avchan != aserver.afk_channel and
+                    avchan.permissions_for(
+                        bserver.me).connect):
+                path = "{}/{}/{}/join".format(self.sound_base,
+                                              aserver.id, after.id)
+                if os.path.exists(path):
+                    if sfx_cog is not None:
+                        if not sfx_cog.enqueue_sfx(avchan, path, vol=15):
+                            await self.sound_play(aserver, avchan, path)
+                    else:
+                        await self.sound_play(aserver, avchan, path)
+
+            # went from one channel to another
+            elif bvchan is not None and avchan is not None:
+                if (self.settings[bserver.id]["leave_on"] and
+                        bvchan != bserver.afk_channel and
+                        bvchan.permissions_for(
+                            bserver.me).connect):
+                    path = "{}/{}/{}/leave".format(
+                        self.sound_base, bserver.id, before.id)
+                    if os.path.exists(path):
+                        if sfx_cog is not None:
+                            if not sfx_cog.enqueue_sfx(bvchan, path, vol=15):
+                                await self.sound_play(bserver, bvchan, path)
+                        else:
+                            await self.sound_play(bserver, bvchan, path)
+                if (self.settings[aserver.id]["join_on"] and
+                        avchan != aserver.afk_channel and
+                        avchan.permissions_for(
+                            bserver.me).connect):
+                    path = "{}/{}/{}/join".format(self.sound_base,
+                                                  aserver.id, after.id)
+                    if os.path.exists(path):
+                        if sfx_cog is not None:
+                            if not sfx_cog.enqueue_sfx(avchan, path, vol=15):
+                                await self.sound_play(aserver, avchan, path)
+                        else:
+                            await self.sound_play(aserver, avchan, path)
+
+            # went from a channel to no channel
+            elif (bvchan is not None and
+                  avchan is None and
+                  self.settings[bserver.id]["leave_on"] and
+                  bvchan != bserver.afk_channel and
+                  bvchan.permissions_for(
+                    bserver.me).connect):
+                path = "{}/{}/{}/leave".format(self.sound_base,
+                                               bserver.id, before.id)
+                if os.path.exists(path):
+                    if sfx_cog is not None:
+                        if not sfx_cog.enqueue_sfx(bvchan, path, vol=15):
+                            await self.sound_play(bserver, bvchan, path)
+                    else:
+                        await self.sound_play(bserver, bvchan, path)
 
 
-client.run(TOKEN)
+def check_folders():
+    if not os.path.exists("data/customjoinleave"):
+        print("Creating data/customjoinleave directory...")
+        os.makedirs("data/customjoinleave")
+
+
+def check_files():
+    f = "data/customjoinleave/settings.json"
+    if not dataIO.is_valid_json(f):
+        print("Creating data/customjoinleave/settings.json...")
+        dataIO.save_json(f, {})
+
+
+def setup(bot: commands.Bot):
+    check_folders()
+    check_files()
+    n = CustomJoinLeave(bot)
+    bot.add_listener(n.voice_state_update, "on_voice_state_update")
+
+    bot.add_cog(n)
